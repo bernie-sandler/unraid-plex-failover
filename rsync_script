@@ -1,0 +1,154 @@
+#!/bin/bash
+# plex_db_sync.sh — Mirror Plex DB from primary → secondary when secondary Plex service is NOT running.
+# - Safe to run from cron or on a schedule.
+# - Assumes official plexinc images & standard appdata layout.
+# - Set DRY_RUN=1 for a preview (no changes).
+
+set -u  # (no -e so we can control exit paths and log errors ourselves)
+
+# --- Config ------------------------------------------------------------------
+SRC="/mnt/user/appdata/Plex-Media-Server/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+DEST="/mnt/user/appdata/Plex-Media-Server-Secondary/Library/Application Support/Plex Media Server/Plug-in Support/Databases"
+CONTAINER="Plex-Media-Server-Secondary"
+
+# Process name pattern to detect inside container
+PLEX_PROCESS_PATTERN="${PLEX_PROCESS_PATTERN:-Plex Media Server}"
+
+LOG_FILE="/var/log/plex_db_sync.log"
+LOCK_FILE="/var/tmp/plex_db_sync.lock"
+
+# Optional: DRY_RUN=1 rsyncs with -n (no changes).
+DRY_RUN="${DRY_RUN:-0}"
+
+# --- Helpers -----------------------------------------------------------------
+ts()   { date "+%Y-%m-%d %H:%M:%S %Z"; }
+log()  { echo "$(ts): $*" | tee -a "$LOG_FILE"; }
+die()  { log "ERROR: $*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+container_running() {
+  docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | tr -d '[:space:]' || echo "false"
+}
+
+# Returns "true" if the Plex process appears to be running inside the container.
+plex_proc_running_in_container() {
+  local c="$1"
+  local pat="${2:-$PLEX_PROCESS_PATTERN}"
+
+  # If the container itself is not running, report "false" (service not running).
+  if [ "$(container_running "$c")" != "true" ]; then
+    echo "false"
+    return
+  fi
+
+  # Prefer pgrep if available in the container; fall back to ps|grep.
+  if docker exec "$c" sh -c 'command -v pgrep >/dev/null 2>&1'; then
+    if docker exec "$c" sh -lc "pgrep -f \"${pat}\" >/dev/null 2>&1"; then
+      echo "true"
+    else
+      echo "false"
+    fi
+  else
+    if docker exec "$c" sh -lc "ps aux 2>/dev/null | grep -F \"${pat}\" | grep -v grep >/dev/null"; then
+      echo "true"
+    else
+      echo "false"
+    fi
+  fi
+}
+
+DISABLE_FILE="/var/tmp/plex_backup_in_progress"
+if [ -f "$DISABLE_FILE" ]; then
+  log "Backup flag found ($DISABLE_FILE). Skipping database sync."
+  exit 0
+fi
+
+# Prefer flock (fd 9), else mkdir lock
+take_lock() {
+  if have flock; then
+    exec 9>"$LOCK_FILE" || die "Unable to open lock file: $LOCK_FILE"
+    flock -n 9 || { log "Another sync is running (flock). Skipping."; exit 0; }
+    # flock auto-releases when fd 9 closes on exit
+  else
+    if ! mkdir "$LOCK_FILE" 2>/dev/null; then
+      log "Another sync is running (mkdir lock). Skipping."
+      exit 0
+    fi
+    trap 'rmdir "$LOCK_FILE" 2>/dev/null || true' EXIT
+  fi
+}
+
+nice_wrap() {
+  # Use ionice/nice if available; otherwise run command as-is
+  if have ionice; then
+    ionice -c2 -n7 nice -n 10 "$@"
+  else
+    nice -n 10 "$@"
+  fi
+}
+
+# --- Start -------------------------------------------------------------------
+take_lock
+
+have docker || die "docker not found in PATH."
+have rsync  || die "rsync not found in PATH."
+
+# Ensure paths exist
+[ -d "$SRC" ]  || die "Source path missing: $SRC"
+if [ ! -d "$DEST" ]; then
+  log "Destination path missing: $DEST (creating...)"
+  mkdir -p "$DEST" || die "Could not create $DEST"
+fi
+
+# Decide based on *internal* Plex process state
+CONTAINER_STATE="$(container_running "$CONTAINER")"
+PLEX_INSIDE_RUNNING="$(plex_proc_running_in_container "$CONTAINER" "$PLEX_PROCESS_PATTERN")"
+
+if [ "$CONTAINER_STATE" = "true" ] && [ "$PLEX_INSIDE_RUNNING" = "true" ]; then
+  log "Plex service in $CONTAINER appears ACTIVE (matched: \"$PLEX_PROCESS_PATTERN\"). Skipping DB sync."
+  exit 0
+fi
+
+if [ "$CONTAINER_STATE" = "true" ] && [ "$PLEX_INSIDE_RUNNING" = "false" ]; then
+  log "Container $CONTAINER is RUNNING, but Plex service is STOPPED. Proceeding with database sync…"
+elif [ "$CONTAINER_STATE" != "true" ]; then
+  log "Container $CONTAINER is STOPPED. Proceeding with database sync…"
+fi
+
+# --- rsync build -------------------------------------------------------------
+RSYNC_ARGS=(
+  -aH --delete
+  --itemize-changes
+  --info=stats2,flist2,del2
+  --human-readable
+  --inplace
+  --exclude=".DS_Store"
+  --exclude="lost+found"
+)
+
+# Dry-run?
+if [ "$DRY_RUN" = "1" ]; then
+  RSYNC_ARGS+=( -n )
+  log "DRY_RUN=1 enabled: no changes will be made."
+fi
+
+# --- Execute -----------------------------------------------------------------
+SRC_DIR="$SRC/"
+DEST_DIR="$DEST/"
+
+if OUTPUT="$(nice_wrap rsync "${RSYNC_ARGS[@]}" -- "$SRC_DIR" "$DEST_DIR" 2>&1)"; then
+  CHANGES="$(printf '%s\n' "$OUTPUT" | awk '/^[-dchslp\.][^ ]/ {print}' | wc -l | tr -d ' ')"
+  if [ "$DRY_RUN" = "1" ]; then
+    log "DRY-RUN completed. Would change items: $CHANGES"
+  else
+    log "Sync completed successfully. Changed items: $CHANGES"
+  fi
+  printf '%s\n' "$OUTPUT" | awk '/Number of files:|Number of regular files:|Number of created files:|Number of deleted files:|Total transferred file size:|Literal data:|Matched data:|File list size:|Total bytes sent:|Total bytes received:/' >> "$LOG_FILE"
+  exit 0
+else
+  RC=$?
+  log "ERROR: rsync failed with exit code $RC"
+  printf '%s\n' "$OUTPUT" | tail -n 50 >> "$LOG_FILE"
+  exit "$RC"
+fi
