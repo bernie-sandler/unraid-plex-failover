@@ -1,0 +1,242 @@
+#!/bin/bash
+# -----------------------------------------------------------------------------
+# Plex in-container failover supervisor (with heartbeat + multi-error support)
+# -----------------------------------------------------------------------------
+# This script supervises two Plex containers (primary + secondary) and ensures
+# only one active Plex Media Server process at a time. The supervisor:
+#   - Starts the primary container on cold boot.
+#   - Promotes the secondary if the primary process dies or logs show errors.
+#   - Supports manual override modes (auto | force_primary | force_secondary).
+#   - Emits clean logs with state changes and optional heartbeat lines.
+#   - Detects multiple known Plex startup errors (configurable).
+#
+# Requirements:
+#   * Assumes your Plex is running from the official repositories:
+#       - plexinc/pms-docker
+#       - plexinc/pms-docker:plexpass
+#     Other Unraid application containers may use different layouts/paths
+#     for logs and service binaries, which could break detection logic.
+#
+# Files:
+#   - Mode file: /var/tmp/plex_failover/mode
+#   - Log file:  /tmp/user.scripts/tmpScripts/Plex Failover Script/log.txt
+#
+# Notes:
+#   * Containers stay UP; Plex inside is started/stopped via /plex_service.sh.
+#   * Log detection tails the last N lines of Plex Media Server.log and matches
+#     error strings (extendable for more error cases).
+#   * Adjust sleep interval (default 30s) to tune responsiveness vs. overhead.
+#
+# Author: Trevon Rawls
+# -----------------------------------------------------------------------------
+
+
+# === User Config =============================================================
+
+PRIMARY_CONTAINER="Plex-Media-Server"
+SECONDARY_CONTAINER="Plex-Media-Server-Secondary"
+
+# Where the mode value lives ("auto" | "force_primary" | "force_secondary")
+MODE_FILE="/var/tmp/plex_failover/mode"
+
+# Log file for this supervisor (shown + persisted)
+LOG_FILE="/tmp/user.scripts/tmpScripts/Plex Failover Script/log.txt"
+
+# Loop pacing and small wait after start attempts
+SLEEP_SECS=10              # loop sleep; choose 30–60s to align with heartbeat
+WAIT_AFTER_START=3
+
+# Enable debug lines (1 on, 0 off)
+DEBUG=${DEBUG:-1}
+
+# Heartbeat interval in seconds. 30–60 recommended. 0 disables heartbeats.
+HEARTBEAT_SECS=10
+
+# Multiple error signatures (case-insensitive regex supported).
+ERROR_PATTERNS=(
+  "Unable to set up server"
+  # Add more patterns as needed:
+  # "database disk image is malformed"
+  # "FATAL.*migration"
+)
+
+# Common Plex log paths (inside the container). First existing path is used.
+PLEX_LOG_PATHS=(
+  "/config/Library/Application Support/Plex Media Server/Logs/Plex Media Server.log"         # linuxserver.io
+  "/var/lib/plexmediaserver/Library/Application Support/Plex Media Server/Logs/Plex Media Server.log" # official
+)
+
+# === Internals (no change normally) =========================================
+
+# Logging helpers
+_log()   { echo "$(date): $*" | tee -a "$LOG_FILE" >/dev/null; }
+_debug() { [ "$DEBUG" = "1" ] && echo "$(date): [DEBUG] $*" >> "$LOG_FILE"; }
+
+# Ensure mode file exists
+[ -f "$MODE_FILE" ] || echo "auto" > "$MODE_FILE"
+
+# Container running?
+ctr_running() {
+  docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true
+}
+
+# Start Plex *inside* container (and container itself, if needed)
+ctr_start() {
+  local ctr="$1"
+  if ! ctr_running "$ctr"; then
+    _debug "Starting container: $ctr"
+    docker start "$ctr" >/dev/null 2>&1 || true
+    sleep 1
+  fi
+  # Only start Plex inside if not already running
+  if [ "$(_proc_state "$ctr")" != "running" ]; then
+    _debug "Starting Plex in $ctr via /plex_service.sh -u"
+    docker exec "$ctr" sh -lc '[ -x /plex_service.sh ] && /plex_service.sh -u' >/dev/null 2>&1 || true
+    sleep "$WAIT_AFTER_START"
+  fi
+}
+
+# Stop Plex *inside* container
+ctr_stop() {
+  local ctr="$1"
+  _debug "Stopping Plex in $ctr via /plex_service.sh -d"
+  docker exec "$ctr" sh -lc '[ -x /plex_service.sh ] && /plex_service.sh -d' >/dev/null 2>&1 || true
+}
+
+# Process presence only
+_proc_state() {
+  local ctr="$1"
+  docker exec "$ctr" sh -lc '
+    if ps -ef 2>/dev/null; then
+      ps -ef | grep -Ei "Plex Media Server" | grep -v grep >/dev/null
+    elif ps aux 2>/dev/null; then
+      ps aux | grep -Ei "Plex Media Server" | grep -v grep >/dev/null
+    else
+      ps | grep -Ei "Plex Media Server" | grep -v grep >/dev/null
+    fi
+  ' >/dev/null 2>&1
+  [ $? -eq 0 ] && echo "running" || echo "stopped"
+}
+
+# Tail Plex log from the first existing path; print nothing if none found.
+_tail_plex_log() {
+  local ctr="$1"
+  # Build a tiny shell script evaluated inside the container
+  local script='
+    for p in '"$(printf '%q ' "${PLEX_LOG_PATHS[@]}")"'; do
+      if [ -f "$p" ]; then
+        tail -n 200 "$p"
+        exit 0
+      fi
+    done
+    exit 0
+  '
+  docker exec "$ctr" sh -lc "$script" 2>/dev/null
+}
+
+# Return "error" if ANY pattern matches the recent log, else "ok"
+_logs_state() {
+  local ctr="$1"
+  local log_out
+  log_out="$(_tail_plex_log "$ctr")"
+  [ -z "$log_out" ] && { echo "ok"; return; }
+
+  local pat
+  for pat in "${ERROR_PATTERNS[@]}"; do
+    if echo "$log_out" | grep -Eiq -- "$pat"; then
+      _debug "$ctr: matched error pattern: $pat"
+      echo "error"
+      return
+    fi
+  done
+  echo "ok"
+}
+
+# Primary health: healthy | error | stopped
+primary_health() {
+  local proc logs
+  proc="$(_proc_state "$PRIMARY_CONTAINER")"
+  if [ "$proc" != "running" ]; then
+    echo "stopped"; return
+  fi
+  logs="$(_logs_state "$PRIMARY_CONTAINER")"
+  [ "$logs" = "ok" ] && echo "healthy" || echo "error"
+}
+
+# Mode getter
+mode_get() { tr -d '[:space:]' < "$MODE_FILE" 2>/dev/null || echo "auto"; }
+
+# Change-only + heartbeat status line
+LAST_STATUS=""
+LAST_HEARTBEAT_EPOCH=0
+_emit_status() {
+  local msg="$1"
+  local now epoch_gap
+  now=$(date +%s)
+  epoch_gap=$(( now - LAST_HEARTBEAT_EPOCH ))
+
+  # Decide if we should emit: change OR heartbeat interval reached
+  if [ "$msg" != "$LAST_STATUS" ] || { [ "$HEARTBEAT_SECS" -gt 0 ] && [ "$epoch_gap" -ge "$HEARTBEAT_SECS" ]; }; then
+    if [ "$msg" = "$LAST_STATUS" ]; then
+      _log "[HEARTBEAT] $msg"
+    else
+      _log "$msg"
+    fi
+    LAST_STATUS="$msg"
+    LAST_HEARTBEAT_EPOCH="$now"
+  fi
+}
+
+# === Main loop ==============================================================
+_log "Supervisor starting (DEBUG=$DEBUG; HEARTBEAT_SECS=$HEARTBEAT_SECS)"
+while true; do
+  MODE="$(mode_get)"
+
+  # Measure states
+  PRIMARY_HEALTH="$(primary_health)"                      # healthy | error | stopped
+  P_PROC="$(_proc_state "$PRIMARY_CONTAINER")"            # running | stopped
+  S_PROC="$(_proc_state "$SECONDARY_CONTAINER")"          # running | stopped
+  ACTIONS=()
+
+  case "$MODE" in
+    auto)
+      case "$PRIMARY_HEALTH" in
+        healthy)
+          if [ "$S_PROC" = "running" ]; then
+            ctr_stop "$SECONDARY_CONTAINER"
+            ACTIONS+=("secondary-stopped"); S_PROC="stopped"
+          fi
+          ;;
+        error)
+          ctr_stop "$PRIMARY_CONTAINER";     ACTIONS+=("primary-stopped");   P_PROC="stopped"
+          ctr_start "$SECONDARY_CONTAINER";  ACTIONS+=("secondary-started"); S_PROC="running"
+          ;;
+        stopped)
+          ctr_start "$PRIMARY_CONTAINER";    ACTIONS+=("primary-warming")
+          # If you prefer instant promotion when the primary CONTAINER is down, uncomment:
+          # if ! ctr_running "$PRIMARY_CONTAINER"; then
+          #   ctr_start "$SECONDARY_CONTAINER"; ACTIONS+=("secondary-started"); S_PROC="running"
+          # fi
+          ;;
+      esac
+      ;;
+    force_primary)
+      ctr_start "$PRIMARY_CONTAINER"; ACTIONS+=("primary-forced"); P_PROC="running"
+      if [ "$S_PROC" = "running" ]; then
+        ctr_stop "$SECONDARY_CONTAINER"; ACTIONS+=("secondary-stopped"); S_PROC="stopped"
+      fi
+      ;;
+    force_secondary)
+      ctr_start "$SECONDARY_CONTAINER"; ACTIONS+=("secondary-forced"); S_PROC="running"
+      if [ "$P_PROC" = "running" ]; then
+        ctr_stop "$PRIMARY_CONTAINER"; ACTIONS+=("primary-stopped"); P_PROC="stopped"
+      fi
+      ;;
+    *)
+      MODE="auto"
+      ;;
+  esac
+
+  _emit_status "mode=$MODE; primary=$PRIMARY_HEALTH; p_proc=$P_PROC; s_proc=$S_PROC${ACTIONS:+; action=${ACTIONS[*]}}"
+  sleep "$SLEEP_SECS"
+done
