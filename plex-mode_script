@@ -1,0 +1,22 @@
+#!/bin/bash
+
+# ensure plex failover state directory exists
+install -d -m 0755 /var/tmp/plex_failover
+
+# ensure default mode file exists
+if [ ! -f /var/tmp/plex_failover/mode ]; then
+  echo "auto" > /var/tmp/plex_failover/mode
+fi
+
+# install the command itself (since /usr/local is RAM)
+install -D -m 0755 /boot/config/custom/bin/plex-mode /usr/local/sbin/plex-mode
+sed -i 's/\r$//' /usr/local/sbin/plex-mode
+
+# install completion and make sure bash-completion is sourced
+install -D -m 0644 /boot/config/custom/bash-completion/plex-mode /etc/bash_completion.d/plex-mode
+grep -q '/etc/bash_completion' /root/.bashrc 2>/dev/null || \
+  echo '[ -f /etc/bash_completion ] && . /etc/bash_completion' >> /root/.bashrc
+
+# load it for current shell (optional)
+[ -f /etc/bash_completion ] && . /etc/bash_completion
+[ -f /etc/bash_completion.d/plex-mode ] && . /etc/bash_completion.d/plex-mode
